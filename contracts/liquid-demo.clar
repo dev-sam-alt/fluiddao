@@ -12,6 +12,7 @@
 (define-constant ERR-INVALID-COUNCIL (err u106))
 (define-constant ERR-INSUFFICIENT-REPUTATION (err u107))
 (define-constant ERR-DELEGATION-DEPTH-EXCEEDED (err u108))
+(define-constant ERR-INVALID-INPUT (err u109))
 
 ;; System Configuration
 (define-constant MIN-PROPOSAL-THRESHOLD u1000)
@@ -21,6 +22,10 @@
 (define-constant BASE-QUORUM-PERCENTAGE u15)
 (define-constant VOICE-CREDITS-PER-CYCLE u100)
 (define-constant EMERGENCY-VOTING-WINDOW u144) ;; ~24 hours in blocks
+(define-constant MIN-VOTING-DURATION u144) ;; minimum 1 day
+(define-constant MAX-VOTING-DURATION u20160) ;; maximum 2 weeks
+(define-constant MAX-COUNCIL-MEMBERS u20)
+(define-constant MAX-BET-AMOUNT u1000000) ;; 1M STX max bet
 
 ;; Data Maps
 
@@ -132,6 +137,44 @@
 (define-data-var system-paused bool false)
 (define-data-var total-governance-tokens uint u0)
 
+;; Input Validation Functions
+
+;; Validate string is not empty and within bounds
+(define-private (is-valid-string-utf8 (input (string-utf8 256)))
+  (and (> (len input) u0) (<= (len input) u256)))
+
+;; Validate description is not empty and within bounds
+(define-private (is-valid-description (input (string-utf8 2048)))
+  (and (> (len input) u0) (<= (len input) u2048)))
+
+;; Validate ASCII string is not empty and within bounds
+(define-private (is-valid-string-ascii (input (string-ascii 64)))
+  (and (> (len input) u0) (<= (len input) u64)))
+
+;; Validate council name
+(define-private (is-valid-council-name (input (string-utf8 128)))
+  (and (> (len input) u0) (<= (len input) u128)))
+
+;; Validate council description
+(define-private (is-valid-council-desc (input (string-utf8 512)))
+  (and (> (len input) u0) (<= (len input) u512)))
+
+;; Validate voting duration
+(define-private (is-valid-voting-duration (duration uint))
+  (and (>= duration MIN-VOTING-DURATION) (<= duration MAX-VOTING-DURATION)))
+
+;; Validate proposal ID exists
+(define-private (is-valid-proposal-id (proposal-id uint))
+  (and (> proposal-id u0) (<= proposal-id (var-get proposal-counter))))
+
+;; Validate amount is reasonable
+(define-private (is-valid-amount (amount uint))
+  (and (> amount u0) (<= amount MAX-BET-AMOUNT)))
+
+;; Validate list length
+(define-private (is-valid-member-list (members (list 20 principal)))
+  (and (> (len members) u0) (<= (len members) MAX-COUNCIL-MEMBERS)))
+
 ;; Helper Functions
 
 ;; Calculate quadratic voting cost
@@ -169,6 +212,12 @@
     (voting-deadline (+ block-height voting-duration))
     (quorum (calculate-dynamic-quorum proposal-id))
   )
+    ;; Input validation
+    (asserts! (is-valid-string-utf8 title) ERR-INVALID-INPUT)
+    (asserts! (is-valid-description description) ERR-INVALID-INPUT) 
+    (asserts! (is-valid-string-ascii topic) ERR-INVALID-INPUT)
+    (asserts! (is-valid-voting-duration voting-duration) ERR-INVALID-INPUT)
+    
     ;; Check if user has minimum tokens to create proposal
     (asserts! (>= (stx-get-balance tx-sender) MIN-PROPOSAL-THRESHOLD) ERR-INSUFFICIENT-TOKENS)
     
@@ -215,10 +264,12 @@
     
     (ok proposal-id)))
 
-
 ;; Revoke delegation for a specific topic
 (define-public (revoke-delegation (topic (string-ascii 64)))
   (let ((delegator tx-sender))
+    ;; Input validation
+    (asserts! (is-valid-string-ascii topic) ERR-INVALID-INPUT)
+    
     (map-delete delegation-registry { delegator: delegator, topic: topic })
     (map-delete delegation-chains { voter: delegator, topic: topic })
     (ok true)))
@@ -232,6 +283,13 @@
   (min-reputation uint)
   (has-veto-power bool))
   (begin
+    ;; Input validation
+    (asserts! (is-valid-string-ascii council-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-council-name name) ERR-INVALID-INPUT)
+    (asserts! (is-valid-council-desc description) ERR-INVALID-INPUT)
+    (asserts! (is-valid-member-list initial-members) ERR-INVALID-INPUT)
+    (asserts! (> min-reputation u0) ERR-INVALID-INPUT)
+    
     ;; Only contract owner can create councils initially
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     
@@ -252,6 +310,10 @@
 ;; Place a prediction bet on a proposal outcome
 (define-public (place-prediction-bet (proposal-id uint) (amount uint) (predicted-outcome bool))
   (let ((bettor tx-sender))
+    ;; Input validation
+    (asserts! (is-valid-proposal-id proposal-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-amount amount) ERR-INVALID-INPUT)
+    
     ;; Check if proposal exists
     (asserts! (is-some (map-get? proposals { proposal-id: proposal-id })) ERR-INVALID-PROPOSAL)
     
@@ -294,40 +356,44 @@
 
 ;; Execute a passed proposal (simplified implementation)
 (define-public (execute-proposal (proposal-id uint))
-  (match (map-get? proposals { proposal-id: proposal-id })
-    proposal-data
-      (let (
-        (total-quadratic-votes (+ (get quadratic-for proposal-data) (get quadratic-against proposal-data)))
-        (quorum-met (>= total-quadratic-votes (get quorum-required proposal-data)))
-        (proposal-passed (> (get quadratic-for proposal-data) (get quadratic-against proposal-data)))
-      )
-        (asserts! (is-eq (get stage proposal-data) "voting") ERR-INVALID-PROPOSAL)
-        (asserts! (>= block-height (get voting-deadline proposal-data)) ERR-PROPOSAL-EXPIRED)
-        (asserts! quorum-met ERR-INSUFFICIENT-TOKENS)
-        (asserts! proposal-passed ERR-INVALID-PROPOSAL)
-        (asserts! (not (get executed proposal-data)) ERR-INVALID-PROPOSAL)
-        
-        ;; Mark as executed
-        (map-set proposals 
-          { proposal-id: proposal-id }
-          (merge proposal-data { 
-            executed: true,
-            stage: "executed"
-          }))
-        
-        ;; Resolve prediction market
-        (match (map-get? prediction-markets { proposal-id: proposal-id })
-          market-data
-            (map-set prediction-markets
-              { proposal-id: proposal-id }
-              (merge market-data { 
-                resolved: true,
-                actual-outcome: (some true)
-              }))
-          true)
-        
-        (ok true))
-    ERR-INVALID-PROPOSAL))
+  (begin
+    ;; Input validation
+    (asserts! (is-valid-proposal-id proposal-id) ERR-INVALID-INPUT)
+    
+    (match (map-get? proposals { proposal-id: proposal-id })
+      proposal-data
+        (let (
+          (total-quadratic-votes (+ (get quadratic-for proposal-data) (get quadratic-against proposal-data)))
+          (quorum-met (>= total-quadratic-votes (get quorum-required proposal-data)))
+          (proposal-passed (> (get quadratic-for proposal-data) (get quadratic-against proposal-data)))
+        )
+          (asserts! (is-eq (get stage proposal-data) "voting") ERR-INVALID-PROPOSAL)
+          (asserts! (>= block-height (get voting-deadline proposal-data)) ERR-PROPOSAL-EXPIRED)
+          (asserts! quorum-met ERR-INSUFFICIENT-TOKENS)
+          (asserts! proposal-passed ERR-INVALID-PROPOSAL)
+          (asserts! (not (get executed proposal-data)) ERR-INVALID-PROPOSAL)
+          
+          ;; Mark as executed
+          (map-set proposals 
+            { proposal-id: proposal-id }
+            (merge proposal-data { 
+              executed: true,
+              stage: "executed"
+            }))
+          
+          ;; Resolve prediction market
+          (match (map-get? prediction-markets { proposal-id: proposal-id })
+            market-data
+              (map-set prediction-markets
+                { proposal-id: proposal-id }
+                (merge market-data { 
+                  resolved: true,
+                  actual-outcome: (some true)
+                }))
+            true)
+          
+          (ok true))
+      ERR-INVALID-PROPOSAL)))
 
 ;; Read-only functions
 
@@ -369,6 +435,10 @@
 ;; Allocate initial governance tokens
 (define-public (allocate-governance-tokens (amount uint))
   (begin
+    ;; Input validation
+    (asserts! (> amount u0) ERR-INVALID-INPUT)
+    (asserts! (<= amount u1000000000) ERR-INVALID-INPUT) ;; max 1B tokens
+    
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
     (var-set total-governance-tokens (+ (var-get total-governance-tokens) amount))
     (ok true)))
